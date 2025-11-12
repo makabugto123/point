@@ -2,20 +2,21 @@
 """
 Render-ready Telegram bot:
 - FastAPI provides health endpoints for Render.
-- Telegram bot runs as a background task (polling).
+- Telegram bot runs as a background task (polling) integrated with uvicorn's event loop.
 - SQLite stores every awarded point.
+- DMs -> "Bawal na boy 😎", group messages must be >= MIN_CHARS to earn points (COOLDOWN_SECONDS).
 """
 
 import os
-import asyncio
 import sys
 import types
 import time
 import re
 import sqlite3
+import asyncio
 from typing import Optional, List, Tuple
 
-# === imghdr shim (from your original) ===
+# imghdr shim (keeps compatibility with your environment)
 if "imghdr" not in sys.modules:
     fake_imghdr = types.ModuleType("imghdr")
     def what(file, h=None):
@@ -23,11 +24,12 @@ if "imghdr" not in sys.modules:
     fake_imghdr.what = what
     sys.modules["imghdr"] = fake_imghdr
 
-# === web / bot libs ===
+# Web and server
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
 
+# Telegram
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -37,25 +39,17 @@ from telegram.ext import (
     filters,
 )
 
-# === CONFIG from environment ===
-TOKEN = os.environ.get("TOKEN")  # set TOKEN in Render dashboard (required)
+# Configuration (use Render environment variables)
+TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise SystemExit("ERROR: TOKEN environment variable is required.")
 
 DB_PATH = os.environ.get("DB_PATH", "points.db")
-MIN_CHARS = int(os.environ.get("MIN_CHARS", "15"))  # min chars to earn point
+MIN_CHARS = int(os.environ.get("MIN_CHARS", "15"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "20"))
 
-# === Validation logic ===
+# Validation logic
 def is_valid_text_for_points(text: str) -> bool:
-    """
-    Returns True if text should be considered valid for awarding points.
-    Requirements:
-      - At least MIN_CHARS characters (this is checked earlier too)
-      - Contains letters
-      - Contains a vowel
-      - Not trivial like same character repeated many times
-    """
     t = text.strip()
     if len(t) < MIN_CHARS:
         return False
@@ -67,9 +61,8 @@ def is_valid_text_for_points(text: str) -> bool:
         return False
     return True
 
-# === SQLite helpers ===
+# SQLite helpers
 def get_conn():
-    # check_same_thread=False so background tasks & FastAPI endpoints can share safely
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -110,7 +103,8 @@ def ensure_user_in_db(user_id: int, first_name: Optional[str], last_name: Option
 
 def add_point_to_db(user_id: int, meta: Optional[str] = None):
     with get_conn() as c:
-        c.execute("INSERT INTO points (user_id, ts, meta) VALUES (?, ?, ?)", (user_id, int(time.time() * 1000), meta))
+        c.execute("INSERT INTO points (user_id, ts, meta) VALUES (?, ?, ?)",
+                  (user_id, int(time.time() * 1000), meta))
         c.commit()
 
 def get_user_points_from_db(user_id: int) -> int:
@@ -131,37 +125,31 @@ def get_leaderboard_from_db(limit: int = 10) -> List[Tuple[int, str, int]]:
             LIMIT ?
         """, (limit,))
         rows = cur.fetchall()
-        # rows are tuples (user_id, full_name, points)
         return rows
 
-# === In-memory cooldown cache ===
-# This is acceptable for a single Render instance; if you scale to multiple instances, use shared storage.
+# In-memory cooldown cache (single-instance assumption)
 last_time_cache = {}
 
-# === Bot handlers ===
+# Bot handlers
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user_in_db(user.id, user.first_name, user.last_name)
     last_time_cache.setdefault(user.id, 0)
-    await update.message.reply_text("👋 Welcome! Type messages with at least 15 characters to earn points. ⏳ 1 point every 20 seconds.")
+    await update.message.reply_text(
+        "👋 Welcome! Type messages with at least "
+        f"{MIN_CHARS} characters to earn points. ⏳ 1 point every {COOLDOWN_SECONDS} seconds."
+    )
 
 async def give_point_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Behavior:
-      - If DM (private chat): reply "Bawal na boy 😎" and DO NOT award points.
-      - If group/supergroup: enforce 15-char rule + validation + cooldown; award silently if passes.
-      - If message is too short or invalid: reply "Bawal na boy 😎".
-    """
     chat = update.effective_chat
     user = update.effective_user
     text = (update.message.text or "").strip()
 
-    # If private DM -> reject
+    # If DM -> reject and reply
     if chat and chat.type == "private":
         await update.message.reply_text("Bawal na boy 😎")
         return
 
-    # Ensure user exists in DB for proper leaderboard/name storage
     ensure_user_in_db(user.id, user.first_name, user.last_name)
 
     # Too short -> reply
@@ -174,14 +162,13 @@ async def give_point_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Bawal na boy 😎")
         return
 
-    # Cooldown check
+    # Cooldown
     now = time.time()
     last = last_time_cache.get(user.id, 0)
     if now - last < COOLDOWN_SECONDS:
-        # silently ignore during cooldown
-        return
+        return  # silently ignore during cooldown
 
-    # Award one point (store in DB)
+    # Award point
     add_point_to_db(user.id, meta=None)
     last_time_cache[user.id] = now
     # silent award (no reply)
@@ -204,19 +191,18 @@ async def leaderboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.append(f"{rank}. {display_name} — {pts} pts")
     await update.message.reply_text("\n".join(lines))
 
-# === Create Application (global ref for startup/shutdown) ===
+# --- Telegram Application management integrated with uvicorn loop ---
 telegram_app = None
-telegram_task = None
+telegram_polling_task: Optional[asyncio.Task] = None
 
 async def start_telegram_bot_background():
     """
-    Build the Application and run polling in a background task.
-    We use ApplicationBuilder().token(TOKEN).build() and run its run_polling coroutine
-    in an asyncio Task so FastAPI can continue serving.
+    Initialize Application and start polling inside the running event loop.
+    Uses Application.initialize()/.start() then schedules updater.start_polling() as a task.
     """
-    global telegram_app, telegram_task
+    global telegram_app, telegram_polling_task
     if telegram_app is not None:
-        return  # already started
+        return
 
     telegram_app = ApplicationBuilder().token(TOKEN).build()
 
@@ -226,11 +212,52 @@ async def start_telegram_bot_background():
     telegram_app.add_handler(CommandHandler("leaderboard", leaderboard_handler))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, give_point_handler))
 
-    # run polling in background task
-    telegram_task = asyncio.create_task(telegram_app.run_polling())
-    # run_polling runs until cancelled/stop, so we don't await it here
+    # Prepare and start the app without creating a new event loop
+    await telegram_app.initialize()
+    await telegram_app.start()
 
-# === FastAPI app / health endpoints ===
+    # Prefer using the updater's start_polling coroutine to avoid run_polling() loop handling.
+    updater = getattr(telegram_app, "updater", None)
+    if updater is not None:
+        # start_polling is a coroutine; schedule it as a background task
+        telegram_polling_task = asyncio.create_task(updater.start_polling())
+    else:
+        # Fallback: schedule run_polling() as task (some library versions may require this)
+        telegram_polling_task = asyncio.create_task(telegram_app.run_polling())
+
+async def stop_telegram_bot_background():
+    """
+    Stop polling and shutdown the Application cleanly.
+    """
+    global telegram_app, telegram_polling_task
+    if telegram_polling_task is not None:
+        try:
+            updater = getattr(telegram_app, "updater", None)
+            if updater is not None:
+                await updater.stop_polling()
+        except Exception:
+            pass
+
+        if not telegram_polling_task.done():
+            telegram_polling_task.cancel()
+            try:
+                await asyncio.wait_for(telegram_polling_task, timeout=5.0)
+            except Exception:
+                pass
+        telegram_polling_task = None
+
+    if telegram_app is not None:
+        try:
+            await telegram_app.stop()
+        except Exception:
+            pass
+        try:
+            await telegram_app.shutdown()
+        except Exception:
+            pass
+        telegram_app = None
+
+# FastAPI app and lifecycle events
 api = FastAPI()
 
 @api.get("/")
@@ -243,39 +270,16 @@ async def health():
 
 @api.on_event("startup")
 async def on_startup():
-    """
-    Called when FastAPI starts. Initialize DB and launch the Telegram bot background task.
-    """
     init_db()
-    # Launch the telegram bot background task
+    # start telegram bot background task integrated with uvicorn's loop
     await start_telegram_bot_background()
 
 @api.on_event("shutdown")
 async def on_shutdown():
-    """
-    Clean shutdown: cancel polling task and stop application.
-    """
-    global telegram_app, telegram_task
-    try:
-        if telegram_app is not None:
-            # ask the app to stop
-            await telegram_app.stop()
-    except Exception:
-        pass
-    try:
-        if telegram_task is not None:
-            telegram_task.cancel()
-            # optional: await telegram_task to finish cancelation (with timeout)
-            try:
-                await asyncio.wait_for(telegram_task, timeout=5.0)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    await stop_telegram_bot_background()
 
-# For local dev: allow running with `python web.py`
+# For local dev
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 8000))
-    # For local testing, run uvicorn
     uvicorn.run("web:api", host="0.0.0.0", port=port, log_level="info")
