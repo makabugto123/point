@@ -4,7 +4,9 @@ Render-ready Telegram bot:
 - FastAPI provides health endpoints for Render.
 - Telegram bot runs as a background task (polling) integrated with uvicorn's event loop.
 - SQLite stores every awarded point.
-- DMs -> "Bawal na boy 😎", group messages must be >= MIN_CHARS to earn points (COOLDOWN_SECONDS).
+- Behavior:
+    * DM (private chat) -> bot replies "Bawal na boy 😎" (no points).
+    * Group messages -> enforce MIN_CHARS, validation and COOLDOWN; award silently when passed.
 """
 
 import os
@@ -16,7 +18,7 @@ import sqlite3
 import asyncio
 from typing import Optional, List, Tuple
 
-# imghdr shim (keeps compatibility with your environment)
+# imghdr shim
 if "imghdr" not in sys.modules:
     fake_imghdr = types.ModuleType("imghdr")
     def what(file, h=None):
@@ -39,7 +41,7 @@ from telegram.ext import (
     filters,
 )
 
-# Configuration (use Render environment variables)
+# Config (set TOKEN in Render env)
 TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise SystemExit("ERROR: TOKEN environment variable is required.")
@@ -141,37 +143,40 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def give_point_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    DM -> reply 'Bawal na boy 😎' (no points).
+    Group -> enforce MIN_CHARS + validation + cooldown; award silently if passed.
+    In group: if invalid or too short -> do nothing (silent).
+    """
     chat = update.effective_chat
     user = update.effective_user
     text = (update.message.text or "").strip()
 
-    # If DM -> reject and reply
+    # If DM/private chat -> reply and do not award points
     if chat and chat.type == "private":
         await update.message.reply_text("Bawal na boy 😎")
         return
 
+    # From here, it's a group/supergroup/channel message
+    # Ensure user exists in DB
     ensure_user_in_db(user.id, user.first_name, user.last_name)
 
-    # Too short -> reply
-    if len(text) < MIN_CHARS:
-        await update.message.reply_text("Bawal na boy 😎")
-        return
-
-    # Other validity checks
+    # Validate; if invalid or too short -> stay silent (no reply)
     if not is_valid_text_for_points(text):
-        await update.message.reply_text("Bawal na boy 😎")
+        # do nothing in groups for invalid messages
         return
 
-    # Cooldown
+    # Cooldown check
     now = time.time()
     last = last_time_cache.get(user.id, 0)
     if now - last < COOLDOWN_SECONDS:
-        return  # silently ignore during cooldown
+        # silent ignore during cooldown
+        return
 
-    # Award point
+    # Award point silently
     add_point_to_db(user.id, meta=None)
     last_time_cache[user.id] = now
-    # silent award (no reply)
+    # no reply
 
 async def points_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -191,15 +196,11 @@ async def leaderboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.append(f"{rank}. {display_name} — {pts} pts")
     await update.message.reply_text("\n".join(lines))
 
-# --- Telegram Application management integrated with uvicorn loop ---
+# Telegram Application management integrated with uvicorn loop
 telegram_app = None
 telegram_polling_task: Optional[asyncio.Task] = None
 
 async def start_telegram_bot_background():
-    """
-    Initialize Application and start polling inside the running event loop.
-    Uses Application.initialize()/.start() then schedules updater.start_polling() as a task.
-    """
     global telegram_app, telegram_polling_task
     if telegram_app is not None:
         return
@@ -212,23 +213,18 @@ async def start_telegram_bot_background():
     telegram_app.add_handler(CommandHandler("leaderboard", leaderboard_handler))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, give_point_handler))
 
-    # Prepare and start the app without creating a new event loop
+    # Initialize and start the app inside the running loop
     await telegram_app.initialize()
     await telegram_app.start()
 
-    # Prefer using the updater's start_polling coroutine to avoid run_polling() loop handling.
+    # Start polling via updater.start_polling()
     updater = getattr(telegram_app, "updater", None)
     if updater is not None:
-        # start_polling is a coroutine; schedule it as a background task
         telegram_polling_task = asyncio.create_task(updater.start_polling())
     else:
-        # Fallback: schedule run_polling() as task (some library versions may require this)
         telegram_polling_task = asyncio.create_task(telegram_app.run_polling())
 
 async def stop_telegram_bot_background():
-    """
-    Stop polling and shutdown the Application cleanly.
-    """
     global telegram_app, telegram_polling_task
     if telegram_polling_task is not None:
         try:
@@ -257,7 +253,7 @@ async def stop_telegram_bot_background():
             pass
         telegram_app = None
 
-# FastAPI app and lifecycle events
+# FastAPI app and lifecycle
 api = FastAPI()
 
 @api.get("/")
@@ -271,14 +267,13 @@ async def health():
 @api.on_event("startup")
 async def on_startup():
     init_db()
-    # start telegram bot background task integrated with uvicorn's loop
     await start_telegram_bot_background()
 
 @api.on_event("shutdown")
 async def on_shutdown():
     await stop_telegram_bot_background()
 
-# For local dev
+# Local dev
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 8000))
